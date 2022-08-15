@@ -2,9 +2,13 @@
 
 Selected collection of files for fitting and sampling geometric m-ring models on a GPU using JAX and NumPyro. This repository is a work in progress.
 
+- ```numpyro_sampler.py``` contains the main script for sampling and fitting.
+- Slides for a presentation related to this work are accessible at https://docs.google.com/presentation/d/1SdJtdU2SyUm-1JhMOfeH_VTbPXfRNwtUt8_cz42T0XA/edit?usp=sharing
+- ```jaxperiments.ipynb``` contains a small selection of sample JAX computations, roughly in accordance with the material in the above presentation. This file is also accessible via Google Colab: https://colab.research.google.com/github/saopeter/bayesian_ring_inference/blob/main/jaxperiments.ipynb
+
 ## Usage: 
 
-Running this script with all default values will use NUTS to fit visibility amplitudes and closure phases for an m-ring with 2 beta parameters to simulated data obtained via eht-imaging. 
+Running numpyro_sampler.py with all default values will use NUTS to fit visibility amplitudes and closure phases for an m-ring with 2 beta parameters to simulated data obtained via eht-imaging. 
 
 More generally, this script can be used to fit an arbitrary m-ring model to data. Parameters intended to be user-modifiable are defined at the top of the file. Commonly modified parameters are:
 
