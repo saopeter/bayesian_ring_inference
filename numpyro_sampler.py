@@ -8,20 +8,20 @@ import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
 import jax
 from jax import random
+import jax.scipy.optimize
 
 from m87_calibration import calibrate
-from sampling_utils import *
 
 eht = eh.array.load_txt('EHT2019.txt')
 
 # Fitting parameters
-priors = {"F0":(0, 10), "d": (5, 60), "w": (10, 30), "betas": 1} # F0, d, w uniform; betas is a number of parameters, each of which is uniform in (0,1) and (-pi to pi) in phase
-fit = {"visibilities": False, "visibility amplitudes": False, "closure phases": True, "log closure amplitudes": True}
+priors = {"F0":(0.1, 3), "d": (5, 60), "w": (10, 30), "betas": 2} # F0, d, w uniform; betas is a number of parameters, each of which is uniform in (0,1) in magnitude and (0 to 2pi) in phase
+fit = {"visibilities": False, "visibility amplitudes": True, "closure phases": True, "log closure amplitudes": False}
 fit_target = "simulated" #"M87" or "simulated"
 
 #NUTS hyperparameters
-num_warmup = 2000
-num_samples = 4000
+num_warmup = 1000
+num_samples = 2000
 run_NUTS = True
 
 # # Circular Gaussian model
@@ -39,21 +39,32 @@ run_NUTS = True
 # model = model.add_circ_gauss(f, h*eh.RADPERUAS, x0=dx*eh.RADPERUAS, y0=dy*eh.RADPERUAS)
 
 # Basic M-ring model
-#units of janskys:
 model_type = "mring"
+#units of janskys:
 F0 = 1.3 
 #units of microarcseconds:
-d = 50
-w = 20
+d = 55
+w = 25
 x0 = 0
 y0 = 0
 #dimensionless (complex):
-# betas_amplitudes = [.1]
 betas_amplitudes = [.1, .05]
-# betas_phases = [jnp.pi/4]
-betas_phases = [jnp.pi/4, 3*jnp.pi/4]
+betas_phases = [.2345, 1.777]
 
 params = {"F0":F0, "d":d, "w":w, "x0":x0, "y0":y0, "betas_amplitudes":betas_amplitudes, "betas_phases":betas_phases}
+
+init_params = {}
+noise_factor = 0.2
+for p in params:
+    if type(params[p]) == type([]):
+        jittered = []
+        for elem in params[p]:
+            val = np.random.uniform(-elem*noise_factor, elem*noise_factor)
+            jittered.append(elem+val)
+        init_params[p] = jittered
+    else:
+        val = np.random.uniform(-params[p]*noise_factor, params[p]*noise_factor)
+        init_params[p] = params[p]+val
 
 # Helper function for converting between ehtim mring and my mring model parameters
 def convert_params_to_ehtim(params, model_type=model_type):
@@ -67,8 +78,10 @@ def convert_params_to_ehtim(params, model_type=model_type):
         ehtim_params['F0'] = params['F0']
         ehtim_params['d'] = params['d']*eh.RADPERUAS
         ehtim_params['alpha'] = params['w']*eh.RADPERUAS
-        ehtim_params['x0'] = params['x0']*eh.RADPERUAS
-        ehtim_params['y0'] = params['y0']*eh.RADPERUAS
+        if 'x0' in params:
+            ehtim_params['x0'] = params['x0']*eh.RADPERUAS
+        if 'y0' in params:
+            ehtim_params['y0'] = params['y0']*eh.RADPERUAS
         betas = [ betas_amplitudes[i]*jnp.exp((1j*betas_phases[i])) for i in range(len(betas_amplitudes)) ]
         ehtim_params['beta_list'] = betas
 
@@ -117,11 +130,11 @@ elif fit_target == "simulated":
     model = model.add_thick_mring(**ehtim_params)
 
     # obs = model.observe(eht, tint_sec, tadv_sec, tstart_hr, tstop_hr, bw_hz, ampcal=True, phasecal=True,seed=4)
-    obs = model.observe(eht, tint_sec, tadv_sec, tstart_hr, tstop_hr, bw_hz, ampcal=True, phasecal=False,seed=9)
+    obs = model.observe(eht, tint_sec, tadv_sec, tstart_hr, tstop_hr, bw_hz, ampcal=True, phasecal=False,seed=18)
     obs = obs.add_fractional_noise(.1)
     # obs = model.observe_same_nonoise(obs)
 
-def generate_circ_gauss_model(dx, dy, h, f):
+def circ_gauss_sample_uv(dx, dy, h, f):
     # re-convert from microarcseconds back to radians
     dx = dx*eh.RADPERUAS
     dy = dy*eh.RADPERUAS
@@ -154,7 +167,7 @@ def bessel_j(n, z, num_samples=100):
 # 1, 1 betas eg.1 (note: this produces negative images)
 # 1, 1/root2 1/root2i eg. 2
 
-def generate_m_ring_model(F0, d, w, betas_amplitudes, betas_phases, x0=0, y0=0):
+def m_ring_sample_uv(F0, d, w, betas_amplitudes, betas_phases, x0=0, y0=0):
     d = d*eh.RADPERUAS
     w = w*eh.RADPERUAS
     x0 = x0*eh.RADPERUAS
@@ -212,12 +225,12 @@ def calc_log_closure_amplitudes(ft, logcamp):
     model_lcamp = lcamp12 + lcamp34 - lcamp23 - lcamp14
     return model_lcamp
 
-def gaussian_model():
+def numpyro_gaussian_sampler():
     dx = numpyro.sample("dx", dist.Uniform(low=-40, high=40))
     dy = numpyro.sample("dy", dist.Uniform(low=-40, high=40))
     h = numpyro.sample("h", dist.Uniform(low=0, high=80))
     f = numpyro.sample("f", dist.Uniform(low=0, high=10))
-    ft = generate_circ_gauss_model(dx, dy, h, f)
+    ft = circ_gauss_sample_uv(dx, dy, h, f)
 
     u = obs.data['u']
     v = obs.data['v']
@@ -228,27 +241,28 @@ def gaussian_model():
     numpyro.sample("re(obs)", dist.Normal(ft(u,v).real, sigma), obs = vis.real)
     numpyro.sample("im(obs)", dist.Normal(ft(u,v).imag, sigma), obs = vis.imag)
 
-def mring_model(obs=obs, priors=priors, fit=fit):
+def numpyro_mring_sampler(obs=obs, priors=priors, fit=fit):
 
     # distributions are uniform; betas are specified as a number
 
     F0 = numpyro.sample("F0", dist.Uniform(low=priors["F0"][0], high=priors["F0"][1]))
+    # F0 = numpyro.deterministic("F0", 1.3)
     d = numpyro.sample("d", dist.Uniform(low=priors["d"][0], high=priors["d"][1]))
     w = numpyro.sample("w", dist.Uniform(low=priors["w"][0], high=priors["w"][1]))
     betas_amplitudes = []
     betas_phases = []
-    # TODO: use numpyro plate notation? 
+    # TODO: use numpyro plate notation to indicate conditional independence of variables, potentially speeding up sampling?
     for i in range(priors["betas"]):
         beta_amp = numpyro.sample("abs(b"+str(i+1)+")", dist.Uniform(low=0, high=1))
-        # beta_phase = numpyro.sample("angle(b"+str(i+1)+")", dist.Uniform(low=0, high=2*jnp.pi))
         # NOTE: something about this looks and feels kind of wonky
         with numpyro.handlers.reparam(config= {"angle(b"+str(i+1)+")": numpyro.infer.reparam.CircularReparam()} ):
             beta_phase = numpyro.sample("angle(b"+str(i+1)+")", dist.VonMises(0, 0.001)) #set concentration to something approx. ~0 to simulate a uniform distribution, but not exactly 0 to avoid calculation errors
         betas_amplitudes.append(beta_amp)
         betas_phases.append(beta_phase)
 
-    ft = generate_m_ring_model(F0=F0, d=d, w=w, betas_amplitudes=betas_amplitudes, betas_phases=betas_phases)
+    ft = m_ring_sample_uv(F0=F0, d=d, w=w, betas_amplitudes=betas_amplitudes, betas_phases=betas_phases)
 
+    #XXX: these if statements may not play nicely with JAX control flow
     if fit["visibilities"]:
         u = obs.data['u']
         v = obs.data['v']
@@ -280,9 +294,9 @@ def mring_model(obs=obs, priors=priors, fit=fit):
 
 PPL_model = None
 if model_type == "circ_gauss":
-    PPL_model = gaussian_model
+    PPL_model = numpyro_gaussian_sampler
 elif model_type == "mring":
-    PPL_model = mring_model
+    PPL_model = numpyro_mring_sampler
 
 # Print information about our model and priors
 if fit_target=="simulated":
@@ -291,41 +305,62 @@ elif fit_target=="M87":
     print(f"Fitting M87 data")
 print(f"Fitting the following quantities: {','.join([k for k in fit if fit[k]])}")
 print(f"Priors: {priors}")
+print(f"Initial guess for parameters: {init_params}")
 
-# Start from this source of randomness. We will split keys for subsequent operations.
-rng_key = random.PRNGKey(0)
-rng_key, rng_key_ = random.split(rng_key)
+logcamp = obs.c_amplitudes(ctype='logcamp', debias=True)
+observed_logcamps = logcamp['camp']
+lcamps_sigmas = logcamp['sigmaca']
 
-# Run NUTS.
-kernel = NUTS(PPL_model)
-mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples)
-if run_NUTS:
-    mcmc.run(
-        rng_key_
-    )
-    mcmc.print_summary()
+def objfunc_mring_logcamps(args):
+    #enforce a non-negative constraint on all parameters
+    args = jnp.where(args<0, 0, args)
+    
+    n = len(args)
+    d = args[0]
+    w = args[1]
+    betas_amplitudes = args[2:(n//2 + 1)]
+    # for amp in betas_amplitudes:
+    #     if amp < 0:
+    #         return float('inf')
+    betas_phases = args[n//2+1:]
+    # for phase in betas_phases:
+    #     if phase<0 or phase>2*jnp.pi:
+    #         return float('inf')
+    ft = m_ring_sample_uv(F0=1, d=d, w=w, betas_amplitudes=betas_amplitudes, betas_phases=betas_phases)
+    model_logcamps = calc_log_closure_amplitudes(ft, logcamp)
+    norm = jnp.log(1 / ( jnp.sqrt( 2*jnp.pi*lcamps_sigmas ) ) )
+    exp = (-1/2)*( (model_logcamps-observed_logcamps)/lcamps_sigmas )**2
+    return -sum(norm+exp)
 
 #Assorted helper functions
 
 def plot_trace(samples, model_type=None, truths=None, save=False, filename=None):
     plt.ioff()
     variables = samples.keys()
-    nvars = len(variables)
+    unwrapped_vars = 0
+    for var in variables:
+        if "unwrapped" in var:
+            unwrapped_vars += 1
+    nvars = len(variables) - unwrapped_vars
     nsamples = len(samples[list(variables)[0]])
     fig, ax = plt.subplots(ncols=nvars, figsize=(2*nvars,6))
-    for i, var in enumerate(variables):
-        ax[i].plot(samples[var])
+    j=0
+    for var in variables:
+        if "unwrapped" in var:
+            continue
+        ax[j].plot(samples[var])
         if truths:
             #FIXME: fails if more than 9 beta parameters, needs better approach
             if "abs" in var:
                 beta_n = int(var[-2])-1
-                ax[i].axhline(truths['betas_amplitudes'][beta_n], color="red")
+                ax[j].axhline(truths['betas_amplitudes'][beta_n], color="red")
             elif "angle" in var:
                 beta_n = int(var[-2])-1
-                ax[i].axhline(truths['betas_phases'][beta_n], color="red")
+                ax[j].axhline(truths['betas_phases'][beta_n], color="red")
             else:
-                ax[i].axhline(truths[var], color="red")
-        ax[i].set_ylabel(var)
+                ax[j].axhline(truths[var], color="red")
+        ax[j].set_ylabel(var)
+        j+=1
     fig.supxlabel('Samples')
     fig.suptitle(f"traces, {'model: '+model_type+', ' if model_type else ''}algorithm:numpyro NUTS, samples:{nsamples}")
     fig.tight_layout()
@@ -339,24 +374,32 @@ def plot_trace(samples, model_type=None, truths=None, save=False, filename=None)
 def plot_posterior(samples, model_type=None, truths=None, num_convergence=500, save=False, filename=None):
     plt.ioff()
     variables = samples.keys()
-    nvars = len(variables)
+    unwrapped_vars = 0
+    for var in variables:
+        if "unwrapped" in var:
+            unwrapped_vars += 1
+    nvars = len(variables) - unwrapped_vars
     nsamples = len(samples[list(variables)[0]])
     fig, ax = plt.subplots(ncols=nvars, figsize=(2*nvars,6))
     bin_size = int(np.log(nsamples))+5
-    for i, var in enumerate(variables):
+    j=0
+    for var in variables:
+        if "unwrapped" in var:
+            continue
         parsed_samples = np.array(samples[var][-num_convergence:]) #hist doesn't work well with jax's devicearrays
-        ax[i].hist(parsed_samples, bins=bin_size)
+        ax[j].hist(parsed_samples, bins=bin_size)
         if truths:
             #FIXME: fails if more than 9 beta parameters, needs better approach
             if "abs" in var:
                 beta_n = int(var[-2])-1
-                ax[i].axvline(truths['betas_amplitudes'][beta_n], color="red")
+                ax[j].axvline(truths['betas_amplitudes'][beta_n], color="red")
             elif "angle" in var:
                 beta_n = int(var[-2])-1
-                ax[i].axvline(truths['betas_phases'][beta_n], color="red")
+                ax[j].axvline(truths['betas_phases'][beta_n], color="red")
             else:
-                ax[i].axvline(truths[var], color="red")
-        ax[i].set_xlabel(var)
+                ax[j].axvline(truths[var], color="red")
+        ax[j].set_xlabel(var)
+        j+=1
     fig.supxlabel('Samples')
     fig.suptitle(f"posteriors, {'model: '+model_type+', ' if model_type else ''}algorithm:numpyro NUTS, samples:{nsamples}")
     fig.tight_layout()
@@ -390,11 +433,48 @@ def get_last_sample(samples):
         if "abs" in var:
             n = var[-2]
             betas_amplitudes.append((samples[var][-1], n))
-        elif "angle" in var:
+        # elif "angle" in var and "unwrapped" in var:
+        #     n = var[7]
+        #     #renormalize back to the range [0, 2pi]
+        #     angle = samples[var][-1]
+        #     angle = jnp.remainder(angle + jnp.pi, 2*jnp.pi) - jnp.pi
+        #     betas_phases.append((angle, n))
+        elif "angle" in var and "unwrapped" not in var:
             n = var[-2]
-            betas_phases.append((samples[var][-1], n))
-        else:
+            #renormalize back to the range [0, 2pi]
+            angle = samples[var][-1]
+            angle = jnp.remainder(angle + jnp.pi, 2*jnp.pi) - jnp.pi
+            betas_phases.append((angle, n))
+        elif "angle" not in var:
             output[var] = samples[var][-1]
+    betas_amplitudes = sorted(betas_amplitudes, key=lambda x:x[1])
+    betas_amplitudes = [x[0] for x in betas_amplitudes]
+    betas_phases = sorted(betas_phases, key=lambda x:x[1])
+    betas_phases = [x[0] for x in betas_phases]
+    output["betas_amplitudes"] = betas_amplitudes
+    output["betas_phases"] = betas_phases
+    return output
+
+def get_means(samples):
+    variables = samples.keys()
+    output = {}
+    betas_amplitudes = []
+    betas_phases = []
+    for var in variables:
+        if "abs" in var:
+            n = var[-2]
+            betas_amplitudes.append((samples[var].mean(), n))
+        # elif "angle" in var and "unwrapped" in var:
+        #     n = var[7]
+        #     #renormalize back to the range [0, 2pi]
+        #     angle = samples[var].mean()
+        #     angle = jnp.remainder(angle + jnp.pi, 2*jnp.pi) - jnp.pi
+        #     betas_phases.append((angle, n))
+        elif "angle" in var and "unwrapped" not in var:
+            n = var[-2]
+            betas_phases.append((samples[var].mean(), n))
+        elif "angle" not in var:
+            output[var] = samples[var].mean()
     betas_amplitudes = sorted(betas_amplitudes, key=lambda x:x[1])
     betas_amplitudes = [x[0] for x in betas_amplitudes]
     betas_phases = sorted(betas_phases, key=lambda x:x[1])
@@ -408,7 +488,6 @@ def plot_all(samples, model_type=None, truths=None, save=False, filename=None):
     plot_posterior(samples, model_type=model_type, truths=truths, save=save, filename=filename+"_posterior")
     params_to_image(get_last_sample(samples), save=save, filename=filename+"_image")
 
-#TODO: deduplicate code in this section
 def validation_mring_cphases(params=params, obs=obs):
         # Returns the chi squared value for our calculated closure phases vs. the observed values provided by obs
         #Pull out closure phases from simulated data
@@ -416,7 +495,7 @@ def validation_mring_cphases(params=params, obs=obs):
         cphases = cphase_data['cphase']
         cphases_sigmas = cphase_data['sigmacp']
 
-        ft = generate_m_ring_model(**params)
+        ft = m_ring_sample_uv(**params)
         model_cphases = calc_closure_phases(ft, cphase_data)
         circle_dists = jnp.array( [abs(model_cphases-2*jnp.pi - cphases),
                                    abs(model_cphases - cphases),
@@ -432,7 +511,7 @@ def validation_mring_logcamps(params=params, obs=obs):
         lcamps = logcamp['camp']
         lcamps_sigmas = logcamp['sigmaca']
 
-        ft = generate_m_ring_model(**params)
+        ft = m_ring_sample_uv(**params)
         model_lcamp = calc_log_closure_amplitudes(ft, logcamp)
         chi_sq = (model_lcamp - lcamps)**2/lcamps_sigmas**2
         return sum(chi_sq)/len(chi_sq)
@@ -443,7 +522,7 @@ def validation_mring_vis_amps(params=params, obs=obs):
     vis_amp = obs.unpack(['amp'],debias=True)['amp']
     vis_sigma = obs.data['sigma']
 
-    ft = generate_m_ring_model(**params)
+    ft = m_ring_sample_uv(**params)
     model_vis = abs(ft(u, v))
     chi_sq = (model_vis - vis_amp)**2/vis_sigma**2
     return sum(chi_sq)/len(chi_sq)
@@ -457,7 +536,19 @@ def validation_mring_sample_uv(params=params,obs=obs):
     u = obs.data['u']
     v = obs.data['v']
     y = model.sample_uv(u, v)
-    ft = generate_m_ring_model(**params)
+    ft = m_ring_sample_uv(**params)
     yy = ft(u, v)
     return jnp.allclose(y, yy)
 
+# Start from this source of randomness. We will split keys for subsequent operations.
+rng_key = random.PRNGKey(0)
+rng_key, rng_key_ = random.split(rng_key)
+
+# Run NUTS.
+kernel = NUTS(PPL_model)
+mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples)
+if run_NUTS:
+    mcmc.run(
+        rng_key_, init_params=init_params
+    )
+    mcmc.print_summary()
